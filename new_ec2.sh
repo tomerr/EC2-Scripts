@@ -1,6 +1,6 @@
 #!/bin/bash
 
-instance_type="c4.large"
+instance_type="c5.large"
 
 function spin {
         REWRITE="\e[25D\e[1A\e[K"
