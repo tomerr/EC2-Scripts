@@ -1,0 +1,77 @@
+#!/bin/bash
+yum -y update
+yum -y install dos2unix
+
+#variables
+INSTANCE_ID=`curl http://169.254.169.254/latest/meta-data/instance-id`
+REGION=`curl http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null | sed s'/.$//'`
+HOST_NAME=$(aws ec2 describe-instances --region ${REGION} --instance-ids ${INSTANCE_ID} --query 'Reservations[*].Instances[*].[Tags[?Key==`Name`].Value[]]' --output text)
+HOST_TYPE=$(aws ec2 describe-instances --region ${REGION} --instance-ids ${INSTANCE_ID} --query 'Reservations[*].Instances[*].[Tags[?Key==`Type`].Value[]]' --output text)
+OLD_HOST_NAME=`hostname`
+
+echo "allow non-cert login"
+sed -i s/"PasswordAuthentication no"/"PasswordAuthentication yes"/g /etc/ssh/sshd_config
+sed -i s/"PermitRootLogin .*"//g /etc/ssh/sshd_config
+echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+service sshd reload
+
+echo "Change hostnames"
+sed -i -e s/${OLD_HOST_NAME}/${HOST_NAME}/g /etc/hosts
+#sed -d s?${OLD_HOST_NAME}?${HOST_NAME}?g /etc/hosts
+hostname ${HOST_NAME}
+MYIP=$(ifconfig | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1')
+echo "$MYIP   ${HOST_NAME}" >> /etc/hosts
+
+sed -i /HOSTNAME/s/=.*/=${HOST_NAME}/g /etc/sysconfig/network
+
+aws_subnet_dns=`ip route | grep default | awk '{print $3}' | grep -Eo '([0-9]*\.){3}' | xargs -i echo {}2`
+
+echo "options timeout:2 attempts:5" > /etc/resolv.conf
+echo "nameserver 10.2.0.165" >> /etc/resolv.conf
+echo "nameserver 10.2.10.183" >> /etc/resolv.conf
+echo "nameserver $aws_subnet_dns" >> /etc/resolv.conf
+
+##Add to domain
+sed -i -e '/PEERDNS=/ s/=.*/=no/' /etc/sysconfig/network-scripts/ifcfg-eth0
+realm leave
+bash -c 'echo Sm9pbkQ5MjEhCg== | base64 -d | realm join -U jdomain@Tradair.amazonworkspaces.com Tradair.amazonworkspaces.com'
+sed -i -e '/use_fully_qualified_names =/ s/ .*/ = False/' /etc/sssd/sssd.conf
+/etc/init.d/sssd restart
+
+#Add PROD permissions
+sudo realm permit --groups "SuperProd-Users"
+sudo realm permit --groups "Prod-Users"
+sudo realm permit --groups "NOC-Users"
+
+#add sudoers
+echo "%Domain\ Admins@Tradair.amazonworkspaces.com ALL=(ALL:ALL) ALL" > /etc/sudoers.d/00domain-users
+echo "%SuperProd-Users@Tradair.amazonworkspaces.com  ALL=(ALL:ALL) ALL" >> /etc/sudoers.d/00domain-users
+echo "%PROD-Users@Tradair.amazonworkspaces.com  ALL=(ALL:ALL) ALL" >> /etc/sudoers.d/00domain-users
+echo "%NOC-Users@Tradair.amazonworkspaces.com  ALL=(ALL)     /usr/bin/tradair" >> /etc/sudoers.d/00domain-users
+#If UAT
+if [[ "$HOST_TYPE" -eq "UAT" ]]; then
+        sudo realm permit --groups "UAT-Users"
+        echo "%UAT-Users@Tradair.amazonworkspaces.com  ALL=(ALL)     /usr/bin/tradair" >> /etc/sudoers.d/00domain-users
+fi
+chmod 440 /etc/sudoers.d/00domain-users
+
+sudo realm permit --groups --withdraw "domain users"
+authconfig --enablemkhomedir --update
+
+##Call jenkins to move the host in AD to folder by his type value
+echo "curl to jenkins"
+curl "http://jenkins.tradair.com:8080/view/Update/job/addToDomain/buildWithParameters?token=yahalimedved&instanceId=${INSTANCE_ID}&region=${REGION}&ANSIBLE_PLAYBOOK=/etc/ansible/roles/addToDomain/site.yml" --user remote:Panda230
+
+echo > /var/log/TradairAudit.log
+sudo chmod 777 /var/log/TradairAudit.log
+echo 'function lessfix { sed "s/[\x01]/|/g" "$1" | less; } ' >> /etc/bashrc
+
+#install datadog agent
+DD_API_KEY=7778bce6e672c41dc3ae2c46eecc692a bash -c "$(curl -L https://raw.githubusercontent.com/DataDog/dd-agent/master/packaging/datadog-agent/source/install_agent.sh)"
+
+sudo yum -y erase ntp*
+sudo yum -y install chrony
+sudo service chronyd start
+chronyc sources -v
+chronyc tracking
+chkconfig chronyd on
